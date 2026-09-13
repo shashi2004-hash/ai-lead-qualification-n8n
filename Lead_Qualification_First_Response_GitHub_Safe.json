@@ -1,0 +1,635 @@
+{
+  "name": "Lead Qualification and First Response",
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "const CONFIG = {\n  company: \"Kreo\",\n  offer: \"Premium gaming and creator gear designed and sold in India — mechanical keyboards (e.g. Swarm, hive65), gaming mice, gaming chairs, audio devices, streaming/lighting accessories, and the Kreo Kontrol configuration software\",\n  icp: \"Indian gamers, streamers, and content creators; also esports orgs and retailers seeking sponsorship, bulk, or stocking partnerships\",\n  deal_size: \"Retail: Rs 699–18,999 per item. Partnership/bulk/esports deals: variable, evaluate case by case\",\n  deal_breakers: \"outside India, counterfeit/resale disputes, requests for products not in current lineup, non-serious troll submissions\"\n};\n// ==============================================\n\nconst body = $input.first().json.body || $input.first().json;\n\n// Normalize whatever the form sends into a flat, clean object.\n// Typeform sends nested answers; a generic webhook may already be flat.\nlet lead = {};\nif (body.form_response) {\n  // Typeform native payload shape\n  const answers = body.form_response.answers || [];\n  for (const a of answers) {\n    const key = a.field.ref || a.field.id;\n    lead[key] = a.text || a.email || a.number || a.choice?.label || a.phone_number || JSON.stringify(a);\n  }\n  lead.submitted_at = body.form_response.submitted_at;\n} else {\n  lead = { ...body };\n   lead.name = body.Name || body.name || ''; lead.email = body.Email || body.email || ''; lead.company = body.Company || body.company || ''; lead.message = body.Message || body.message || '';\n}\n\nconst leadJson = JSON.stringify(lead, null, 2);\n\nconst prompt = `You are the lead qualification layer for ${CONFIG.company}.\n\nCompany context:\nWhat we sell: ${CONFIG.offer}\nWho we serve best: ${CONFIG.icp}\nTypical deal size: ${CONFIG.deal_size}\nDeal breakers: ${CONFIG.deal_breakers}\n\nNew submission:\n${leadJson}\n\nTask 1. Score the lead from 1 to 10 on fit.\nWeight these signals in this order:\na. Explicit or implied budget\nb. Fit with our ICP\nc. Urgency and timeline\nd. Company size and stage\nState your reasoning in one sentence before scoring.\n\nTask 2. Write the reply email.\nRules:\nReference something specific they wrote.\nAnswer the question they did not ask but obviously have.\nPropose a call without pressure.\nUnder 150 words. No corporate filler.\nNever invent pricing, features or timelines.\nIf a claim is not in the company context, leave it out.\n\nTask 3. If the submission is spam, an application, a vendor pitch, or is too thin to score, set score to 0 and route to human review instead of replying.\n\nReturn ONLY valid JSON. No preamble, no code fences.\n{\n  \"reasoning\": string,\n  \"score\": number,\n  \"confidence\": \"high\" | \"medium\" | \"low\",\n  \"industry\": string,\n  \"pain_point\": string,\n  \"budget_tier\": \"low\" | \"mid\" | \"high\" | \"unknown\",\n  \"urgent\": boolean,\n  \"route\": \"auto_reply\" | \"human_review\" | \"discard\",\n  \"reply_email\": string,\n  \"crm_notes\": string\n}`;\n\nreturn [{ json: { prompt, raw_payload: lead } }];"
+      },
+      "id": "f3f78c39-77a5-468e-b33e-73324ea54c2d",
+      "name": "Build Claude Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1536,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ contents: [{ parts: [{ text: $json.prompt }] }] }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "2ca794d4-1bc8-417a-ad25-4e6c0475b894",
+      "name": "Claude - Score and Draft",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1328,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $('Build Claude Request').item.json.raw_payload;\nconst resp = $input.first().json;\n\nlet text = '';\ntry {\n text = resp.candidates[0].content.parts[0].text;\n} catch (e) {\n  throw new Error('Claude response missing content: ' + JSON.stringify(resp));\n}\n\n// strip stray code fences just in case\ntext = text.trim().replace(/^```json/, '').replace(/^```/, '').replace(/```$/, '').trim();\n\nlet data;\ntry {\n  data = JSON.parse(text);\n} catch (e) {\n  throw new Error('Could not parse Claude JSON: ' + text);\n}\n\nconst required = ['reasoning','score','confidence','industry','pain_point','budget_tier','urgent','route','reply_email','crm_notes'];\nfor (const f of required) {\n  if (!(f in data)) throw new Error('Missing field \"' + f + '\" in Claude response: ' + text);\n}\n\n// Safety override: never let a low-confidence call auto-send.\n// This is the one rule the workflow enforces in code, not just in the prompt.\nif (data.confidence === 'low' && data.route === 'auto_reply') {\n  data.route = 'human_review';\n  data.crm_notes += ' [auto-routed to human review: low confidence]';\n}\n\ndata.raw_payload = raw;\ndata.route_debug = JSON.stringify(data.route) + ' | length: ' + data.route.length;\nreturn [{ json: data }];"
+      },
+      "id": "7bd40e96-0a84-4375-8e14-be69b7081fae",
+      "name": "Parse and Validate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1104,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "airtableOAuth2Api",
+        "operation": "create",
+        "base": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "table": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Score": "={{$json.score}}",
+            "Confidence": "={{$json.confidence}}",
+            "Industry": "={{$json.industry}}",
+            "Pain Point": "={{$json.pain_point}}",
+            "Budget Tier": "={{$json.budget_tier}}",
+            "Urgent": "={{$json.urgent}}",
+            "CRM Notes": "={{$json.crm_notes}}",
+            "Reasoning": "={{$json.reasoning}}",
+            "Raw Payload": "={{JSON.stringify($json.raw_payload)}}",
+            "Tags": "={{ $json.score >= 4 && $json.score <= 7 ? \"warm\" : ($json.score <= 3 ? \"nurture\" : \"\") }}",
+            "Route": "={{ $json.route }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Score",
+              "displayName": "Score",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Confidence",
+              "displayName": "Confidence",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "high",
+                  "value": "high"
+                },
+                {
+                  "name": "medium",
+                  "value": "medium"
+                },
+                {
+                  "name": "low",
+                  "value": "low"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Industry",
+              "displayName": "Industry",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Pain Point",
+              "displayName": "Pain Point",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Budget Tier",
+              "displayName": "Budget Tier",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "low",
+                  "value": "low"
+                },
+                {
+                  "name": "mid",
+                  "value": "mid"
+                },
+                {
+                  "name": "high",
+                  "value": "high"
+                },
+                {
+                  "name": "unknown",
+                  "value": "unknown"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Urgent",
+              "displayName": "Urgent",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "boolean",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "CRM Notes",
+              "displayName": "CRM Notes",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Reasoning",
+              "displayName": "Reasoning",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Raw Payload",
+              "displayName": "Raw Payload",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Route",
+              "displayName": "Route",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "auto_reply",
+                  "value": "auto_reply"
+                },
+                {
+                  "name": "human_review",
+                  "value": "human_review"
+                },
+                {
+                  "name": "discard",
+                  "value": "discard"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Tags",
+              "displayName": "Tags",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "51a527a4-fa84-471e-91b0-87f07ddfa651",
+      "name": "Log to CRM",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [
+        -880,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "= {{$('Parse and Validate').item.json.raw_payload.email}}",
+        "subject": "Re: your note about {{$json.raw_payload.company || 'your project'}}",
+        "message": "= {{$('Parse and Validate').item.json.reply_email}}",
+        "options": {}
+      },
+      "id": "4731c4c6-7fe2-40f4-aeb5-c93b9de92fd1",
+      "name": "Send Reply",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        -416,
+        32
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{$('Parse and Validate').item.json.score}}",
+              "rightValue": 8,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              },
+              "id": "5d73c520-d69c-482b-a2d6-e9e9c72951ec"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "4782961f-8c58-4eaa-b01d-c930b7ed2d83",
+      "name": "Score >= 8?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -224,
+        64
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "mode": "name",
+          "value": "sales"
+        },
+        "text": "=: Hot lead ({{ $('Parse and Validate').item.json.score }}/10): {{ $('Parse and Validate').item.json.raw_payload.name || $('Parse and Validate').item.json.raw_payload.email }} {{ $('Parse and Validate').item.json.reasoning }} Notes: {{ $('Parse and Validate').item.json.crm_notes }}",
+        "otherOptions": {}
+      },
+      "id": "cdd8f67e-fc1f-4f43-bdfc-bfb8f808a9e8",
+      "name": "Alert Sales",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "mode": "name",
+          "value": "sales"
+        },
+        "text": "=Needs human review: {{ $('Parse and Validate').item.json.raw_payload.name || $('Parse and Validate').item.json.raw_payload.email }}\nReason: {{ $('Parse and Validate').item.json.reasoning }}\nRoute was: {{ $('Parse and Validate').item.json.route }} | Confidence: {{ $('Parse and Validate').item.json.confidence }}",
+        "otherOptions": {}
+      },
+      "id": "655b43dc-5ad3-4a11-8259-828c72a66824",
+      "name": "Route to Human Review",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        -416,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "formTitle": "Partnership Inquiry",
+        "formDescription": "Interested in stocking Kreo gear or partnering with us? Tell us about your business.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Name",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Email",
+              "fieldType": "email",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Company",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Message",
+              "fieldType": "textarea"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.6,
+      "position": [
+        -1760,
+        176
+      ],
+      "id": "22082703-4e43-4cc7-906e-a8f37f286ffc",
+      "name": "On form submission"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.fields.Route }}",
+                    "rightValue": "auto_reply",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "8a331378-4c31-462e-b169-fc4817193ead"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "auto_reply"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "a81c90f4-d847-43c8-be00-8ba003d94a7e",
+                    "leftValue": "={{ $json.fields.Route }}",
+                    "rightValue": "human_review",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "human_review"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "1fe64c99-e1fe-466f-a1bd-cfa8bc1dcc86",
+                    "leftValue": "={{ $json.fields.Route }}",
+                    "rightValue": "discard",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "discard"
+            }
+          ]
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        -688,
+        144
+      ],
+      "id": "80c2317e-131e-4a97-bd54-b249ad8332e0",
+      "name": "Switch"
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "C0BQ40ADR32",
+          "mode": "list",
+          "cachedResultName": "discardedleads"
+        },
+        "text": "=🗑️ Lead discarded (not qualified for reply or review)\n\nReasoning: {{ $json.Reasoning }}\nIndustry: {{ $json.Industry }}\nRaw payload: {{ $json['Raw Payload'] }}",
+        "otherOptions": {}
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.5,
+      "position": [
+        -416,
+        416
+      ],
+      "id": "3e3b9242-f0c4-4582-93b7-87985e5e50c2",
+      "name": "Log Discarded Lead"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Build Claude Request": {
+      "main": [
+        [
+          {
+            "node": "Claude - Score and Draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude - Score and Draft": {
+      "main": [
+        [
+          {
+            "node": "Parse and Validate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse and Validate": {
+      "main": [
+        [
+          {
+            "node": "Log to CRM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log to CRM": {
+      "main": [
+        [
+          {
+            "node": "Switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Reply": {
+      "main": [
+        [
+          {
+            "node": "Score >= 8?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score >= 8?": {
+      "main": [
+        [
+          {
+            "node": "Alert Sales",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "On form submission": {
+      "main": [
+        [
+          {
+            "node": "Build Claude Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch": {
+      "main": [
+        [
+          {
+            "node": "Send Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Route to Human Review",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Discarded Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "nodeGroups": [],
+  "tags": [],
+  "notes": [
+    "GitHub-safe export: credentials, credential IDs, webhook IDs, and cached Airtable references removed.",
+    "Reconnect Airtable, Gmail, Slack, and the AI/API credential after importing into n8n."
+  ]
+}
